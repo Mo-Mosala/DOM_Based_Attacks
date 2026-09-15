@@ -1,0 +1,102 @@
+Practice Lab: DOM XSS via postMessage — javascript: sink with parenthesis stripping
+
+Goal (primary): trigger arbitrary JS execution despite a filter that strips every ( and ) from the message before navigation.
+Goal (stretch): get a dynamically read value (document.domain) visibly displayed, still without a single ( or ) anywhere in the payload.
+
+Constructed vulnerable code
+
+window.addEventListener('message', function(e) {
+  var url = e.data;
+
+  // Weak scheme allowlist — same indexOf substring bug as the earlier lab
+  if (url.indexOf('http:') === -1 && url.indexOf('https:') === -1) return;
+
+  // "Defense in depth" someone bolted on: strip anything call-shaped
+  var clean = url.replace(/[()]/g, '');
+
+  location.href = clean;
+}, false);
+
+Two independent, stacked defects — deliberately, so you have to isolate them separately rather than guess at onecombined payload:
+
+1. Scheme check — bypassable with the trailing-marker trick from the earlier lab (//https://a/).
+2. Content filter — silently deletes (/) rather than rejecting the message. That's an important, realistic detail:print() becomes print (a harmless property reference) and just does nothing — no error, no console warning, nothing to tip you off except "it didn't fire."
+
+---
+
+Step 1 — Confirm the listener, get a baseline failure
+
+Console, on the lab page:
+
+window.postMessage('javascript:print()//https://a/', '*')
+
+Nothing happens. Per the methodology's diagnostic order (§5 Step 2 note): accepted but silent is the signature of acontent filter, distinct from an outright rejection. Don't stop here and conclude the sink is unreachable — that's the mistake this step is designed to catch.
+
+Step 2 — Isolate which layer is failing
+
+Run a positive control that proves the scheme check passes and the sink is live, using no function call at all (so itcan't be affected by a parens filter either way):
+
+window.postMessage('javascript:document.title=1//https://a/', '*')
+
+Tab title changes to 1. This confirms: scheme check ✅, sink reachable ✅, navigation happens ✅. So the earlier failure with print() isn't the scheme check — it's something about the call syntax specifically. That's your signal to go looking for a (/)-stripping filter in the source (methodology §4.3), which you'd find by reading the handler directly, or infer empirically as we just did.
+
+Step 3 — Primary objective: parens-free execution proof
+
+window.postMessage('javascript:window.valueOf=alert,window+0//https://a/', '*')
+
+Scan the string: no (, no ). The regex strip is a no-op on it. Blank alert fires. Primary objective solved — thisalone is a sufficient "arbitrary JS execution" finding, same evidentiary bar as print() in the official labs.
+
+Step 4 — Stretch objective, attempt 1: hardcoded text via tagged template
+
+window.postMessage('javascript:alert`example.com`//https://a/', '*')
+
+Backticks aren't parentheses, so this also survives the filter untouched. Mechanically: alert`example.com` desugars to alert(["example.com"]) — a tagged template always calls its tag function with the literal-strings array as the firstargument. alert stringifies that first argument via Array.prototype.toString, which for a single-element array is just that element with no separator (["x"].join() === "x"). So the alert box shows example.com verbatim.
+
+This proves execution and shows a domain string — but be precise about what it actually proves: it's a hardcodedliteral, known to you in advance because you already know which host you're targeting. It doesn't prove the string was read from the page's runtime context — a skeptical triager could ask "how do I know that wasn't just typed into thepayload?" Worth pairing with a screenshot showing the browser's address bar alongside the alert, or moving to Step 5.
+
+Step 5 — Stretch objective, attempt 2: why alert.bind doesn't get you there
+
+The tempting next idea: use tagged-template syntax to invoke bind and pre-load document.domain as an argument.
+
+window.postMessage('javascript:alert.bind`${document.domain}`()//https://a/', '*')
+
+Two problems, worth documenting as a dead end rather than silently discovering it doesn't work mid-engagement:
+
+1. This still contains ( and ) (the trailing call on the bound function) — the filter strips it, so it's a non-starter for this lab anyway.
+2. Even ignoring that: fn.bind`${document.domain}` desugars to bind(stringsArray, document.domain). Function.prototype.bind(thisArg, ...boundArgs) treats its first argument as the future this — which here is thestrings array, not window. Since alert is a branded WebIDL method requiring this === Window (the same brand check from the original {valueOf: alert} failure), the resulting bound function throws "Illegal invocation" the momentit's actually called — and tagged-template syntax gives you no way to control that first argument, because the engine always fills it with the strings array. This path is structurally unfixable for alert specifically — not amatter of finding the right escaping, the language semantics rule it out.
+
+Good to know before burning time on it against a real target.
+
+Step 6 — Stretch objective, attempt 3 (the actual answer): don't call a function at all
+
+The reframe: the problem was never really "how do I pass an argument through a parenthesis-free function call" — it's "how do I make a dynamic value visible." A property assignment does that with zero function calls, so the entirecall-argument problem evaporates:
+
+window.postMessage('javascript:document.title=document.domain//https://a/', '*')
+
+No (, no ), no tagged template, no coercion trick needed. Tab title becomes the real, runtime-read value of document.domain. This is strictly more convincing than Step 4's hardcoded version (it's provably read from the liveexecution context) and strictly simpler than Step 5's dead end. This is the one to actually use in a report.
+
+Other equally valid parens-free assignment sinks depending on what's most visible/screenshot-friendly in context: location.hash=document.domain, window.name=document.domain, or writing into a visible DOM node's textContent if one'sin scope (document.body.id=document.domain + inspecting via DevTools, etc.).
+
+---
+
+Step 7 — Weaponize
+
+<iframe src="https://example.com/"
+        onload="this.contentWindow.postMessage('javascript:document.title=document.domain//https://a/','*')">
+</iframe>
+
+Same delivery mechanics as every other lab in this thread — onload waits for the listener to attach, the scheme-check bypass marker rides along in the same string as the parens-free payload, no separate encoding needed since neithertrick requires characters the other one's bypass depends on.
+
+---
+
+Verification checklist (the actual "test")
+
+Run these against your own local copy of the vulnerable handler (or the real target, if authorized) in order — each isolates one variable:
+
+- [ ] javascript:print() alone → confirm it fails silently (baseline).
+- [ ] javascript:document.title=1//https://a/ → confirm it succeeds, isolating that the scheme check is not the blocker.
+- [ ] javascript:print()//https://a/ → confirm it still fails even with the scheme bypass present, isolating the parens filter as the second, independent defect.
+- [ ] javascript:window.valueOf=alert,window+0//https://a/ → confirm blank alert fires — primary objective.
+- [ ] javascript:alert`example.com`//https://a/ → confirm alert shows the hardcoded text — proves the tagged-templatemechanism works at all.
+- [ ] javascript:document.title=document.domain//https://a/ → confirm the tab title updates to the real, live-readorigin — stretch objective, and the version worth actually reporting.
+- [ ] Negative control: repeat the last payload with real parentheses reintroduced (document.title=(document.domain))and confirm the filter strips them and the result is unaffected/broken — proves the filter is real and your bypass is actually doing something, not coincidental.
