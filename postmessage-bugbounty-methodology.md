@@ -6,6 +6,19 @@ placeholder throughout: `example.com`. Replace with the in-scope host you're
 actually testing, and confirm program scope before sending any payload
 cross-origin to a live target.
 
+**Companion documents** (kept separate deliberately — different vulnerability
+classes need different testing discipline and don't belong mixed into one
+file):
+- [`dom-based-xss-bugbounty-methodology.md`](./dom-based-xss-bugbounty-methodology.md)
+  — the broader DOM-XSS family this document is one member of: other sources
+  (`location.*`, `document.cookie`, `window.name`), DOM clobbering, DOM-based
+  open redirection, DOM-based cookie manipulation. Read that one first if
+  you're building general DOM-XSS skill; come back here once postMessage
+  specifically is in scope.
+- [`api-credential-access-control-methodology.md`](./api-credential-access-control-methodology.md)
+  — for when recon turns up something that *isn't* a DOM sink at all
+  (hardcoded credentials, backend access-control gaps) — see §3.9.
+
 ---
 
 ## 1. Why postMessage matters as an attack surface
@@ -94,7 +107,7 @@ primitive. Catalog:
 |---|---|---|
 | **A. `eval`/`Function`** | `eval(e.data)` | Direct arbitrary JS execution — highest severity, simplest exploit. |
 | **B. HTML injection** | `el.innerHTML = e.data` / `document.write(e.data)` | Classic markup-based XSS — `<img src=1 onerror=...>`, `<svg onload=...>`. |
-| **C. Navigation / URL** | `location.href = e.data` / `location.assign(e.data)` / `iframe.src = e.data` / `window.open(e.data)` | `javascript:` URI → script execution (if the browser still honors it in that sink — see §5 notes); `https:` URI → open redirect / phishing / reverse tabnabbing. |
+| **C. Navigation / URL** | `location.href = e.data` / `location.assign(e.data)` / `iframe.src = e.data` / `window.open(e.data)` | `javascript:` URI → script execution (if the browser still honors it in that sink — see §5 notes); `https:` URI → open redirect / phishing / reverse tabnabbing. If the origin check passes but the payload doesn't fire, check for a `(`/`)` content filter — see §3.8 for a parenthesis-free fallback. |
 | **D. `JSON.parse` + dispatcher** | `var d = JSON.parse(e.data); switch(d.type) { ... }` | `JSON.parse` is a *format* check, not a *security* check — trace every `case` branch to its own sink independently; this pattern is extremely common in real apps (RPC-style `{action, ...}` or `{type, ...}` messages) and each branch is a separate bug to test. |
 | **E. Sensitive-data handback** | receiver replies with `e.source.postMessage(secretToken, e.origin)` after insufficient validation of the *request* | information disclosure — attacker page requests data it shouldn't be able to get and receives it because the request wasn't authenticated. |
 | **F. CSS/attribute injection** | message content flows into a `style`/attribute value that's later reflected | lower-severity but chainable (see §7 case study 3 — CSS exfiltration). |
@@ -164,6 +177,119 @@ programmatically via `dispatchEvent` from same-page script (e.g. a
 third-party script on the same page forging a fake `MessageEvent`). Its
 absence is a secondary hardening gap, not usually independently exploitable
 from a different origin, but worth noting in a report as defense-in-depth.
+
+### 3.8 Sink-payload character filters — parenthesis-free execution
+
+§3.1–3.7 are all **receiver/origin-layer** bypasses: getting a hostile
+message *accepted* in the first place. This one operates one layer further
+downstream, at the **sink-payload layer** — once a message is accepted and a
+field from it lands in a `javascript:`-URI sink (§2.3 type C:
+`location.href = e.data`, `iframe.src = e.data`, `window.open(e.data)`), some
+apps add a secondary filter on the *content* of that string, most commonly a
+blacklist on `(` and `)` — since `func(...)`-shaped payloads are what most
+off-the-shelf XSS payloads and scanners produce. Treat this as a separate
+obstacle from the origin check, and test it independently: an origin bypass
+can succeed while a parenthesis filter still blocks your payload string, and
+vice versa.
+
+**Why it's bypassable:** JavaScript's coercion machinery (the `ToPrimitive`
+abstract operation) calls `valueOf()`, then `toString()`, on an object
+whenever it's used somewhere a primitive is expected — e.g. the `+` operator.
+That call happens *inside the engine*, so it never appears as literal
+`identifier(...)` text in your payload, defeating a `(`/`)` blacklist
+entirely.
+
+```js
+let obj = {valueOf: alert};
+obj + 1;  // TypeError: Illegal invocation
+```
+This fails because `alert` is a native WebIDL function that checks its
+receiver (`this`) is a `Window`. Coercion calls `valueOf` with `this` bound
+to whatever object it's attached to — a plain object fails that check.
+
+```js
+window.valueOf = alert;
+window + 1;  // alert() fires — this === window, brand check passes
+```
+Overwriting `valueOf` (or `toString`) on `window` itself fixes the `this`
+binding, since coercing `window` calls the overwritten method with `this ===
+window`. In a global scope, `valueOf = alert` alone is equivalent (it's an
+implicit `window.valueOf` assignment), so a working parenthesis-free
+`javascript:` payload is:
+
+```
+javascript:window.valueOf=alert,window+0
+```
+
+Zero `(` or `)` anywhere in the string — defeats a naive paren blacklist,
+while still proving arbitrary script execution in the target's origin (the
+alert fires blank/`undefined`, since coercion invokes `valueOf()` with no
+arguments — that's still sufficient as an execution PoC, same bar as `print()`
+in §5 Step 2). Getting a *visible argument* through (e.g. `document.domain`)
+without parentheses needs an additional primitive on top of this — tagged
+template literals (`` fn`...` ``, which invoke `fn` via backtick syntax
+instead of `()`) or `Function.prototype.bind` — each with its own argument-
+passing quirks; verify live against the actual filter rather than assuming a
+memorized one-liner works, since blacklist implementations vary in what else
+they strip.
+
+Add this to your test matrix (§5 Step 2) whenever a straightforward
+`javascript:print()`-style payload is accepted by the origin check but
+silently fails to fire — that's the signal a content-level filter is
+stripping or rejecting parentheses specifically, distinct from the payload
+being rejected outright.
+
+### 3.9 Recognizing a correctly-guarded listener (so you know when to stop)
+
+Most listeners you find during recon (§4) will **not** be vulnerable — real
+targets get this right more often than tutorials suggest. Two patterns come
+up repeatedly as *hardened*, worth recognizing quickly so you don't burn time
+re-deriving the same negative result:
+
+**Pattern A — identity check instead of string check.**
+```js
+// A same-origin scheduling trick (setImmediate/microtask polyfill via self-postMessage):
+const SENTINEL = "__internal_tick__"; // module-private, never exposed
+window.addEventListener('message', function(e) {
+  if (e.source === window && e.data === SENTINEL) {
+    // ... run queued callback
+  }
+});
+```
+This is **not** an origin-string check at all — it's an object-identity
+comparison (`e.source === window`) plus an equality check against a value
+that only exists in a closure the attacker's page has no access to. There is
+no `startsWith`/`endsWith`/`includes` string logic here to find a bypass
+for — a cross-origin sender's `e.source` can never equal `window` by
+definition. If you find this shape, confirm the sentinel really is
+closure-private (not, e.g., a hardcoded string literal visible in the same
+bundle — if it's guessable/visible, that's a different, much weaker defect
+worth noting, but the *identity* half of the check still holds regardless).
+
+**Pattern B — the listener is unmodified third-party/vendor code.**
+Large SDKs (auth providers, payment processors, analytics libraries) often
+ship their own `postMessage`-based iframe RPC channel internally (e.g. an
+OAuth popup handback, or a cross-tab auth-state sync channel). Before
+spending time on these:
+1. Check whether the surrounding code is genuinely first-party application
+   logic, or a byte-for-byte vendor bundle (file name matches the vendor's
+   own published package, e.g. `firebase-auth.js`, `stripe.js` — minified but
+   otherwise stock).
+2. If it's stock vendor code, a real bug there is a **vendor-level**
+   vulnerability affecting every site using that SDK version, not a
+   target-specific finding — flag it to the vendor's own program if you're
+   confident enough to chase it further, but it's usually not fruitful to
+   keep digging on the target's own program, since heavily-used SDKs get
+   disproportionate scrutiny already and target-specific defects are more
+   likely to exist in the *glue code* around the SDK than inside it.
+
+**When recon turns up something that isn't a DOM/postMessage sink at all**
+(a hardcoded API key, an access-control gap in a backend API, an exposed
+cloud-service credential sitting in the same JS bundle you were grepping for
+`addEventListener('message'`) — that's real and often higher-severity, but
+it's a **different vulnerability class** with its own methodology, testing
+discipline, and reporting shape. Don't force it into this document's
+framework. See the companion methodology for that class.
 
 ---
 
@@ -251,12 +377,24 @@ window.postMessage('javascript:print()//http:', '*')
 
 // Sink type D (JSON.parse + dispatcher):
 window.postMessage(JSON.stringify({type: 'load-channel', url: 'javascript:print()'}), '*')
+
+// Sink type C, if the above is accepted (origin check passes, no error) but
+// silently fails to fire — suspect a paren blacklist on the payload content
+// (§3.8), and confirm with the parenthesis-free fallback:
+window.postMessage('javascript:window.valueOf=alert,window+0', '*')
 ```
 
-If nothing fires, revisit §4.3 — you likely have the wrong field name, wrong
-`type`/`action` value for the dispatcher, or there's an origin check you
-haven't identified yet (test from an actual different-origin tab to rule that
-out before concluding the sink itself is unreachable).
+If nothing fires, work through these in order:
+1. Revisit §4.3 — you likely have the wrong field name, wrong `type`/`action`
+   value for the dispatcher, or there's an origin check you haven't
+   identified yet (test from an actual different-origin tab to rule that out
+   before concluding the sink itself is unreachable).
+2. If the message is clearly *accepted* (no rejection, no console error, just
+   no execution) — suspect a content-level filter on the payload string
+   itself, distinct from the origin check. Try the §3.8 parenthesis-free
+   variant above; if that fires where the parenthesized version didn't,
+   you've confirmed a `(`/`)` blacklist as a second, independent layer worth
+   documenting separately from the origin-check defect in your report.
 
 > **Why `print()` and not `alert(document.domain)`?** `print()` is a safe,
 > unmistakable proof of arbitrary JS execution that doesn't require reading
@@ -456,6 +594,11 @@ incidentally:
 - [ ] The specific origin-check defect, named against §3's taxonomy (or
       "missing entirely").
 - [ ] The specific sink, named against §2.3's taxonomy.
+- [ ] If a content-level filter on the payload (e.g. a `(`/`)` blacklist) was
+      also present and bypassed via §3.8, document it as a **separate**
+      defect from the origin check — both should be listed and both should
+      be fixed, since patching only one leaves the other exploitable on its
+      own if the other control is ever removed or weakened independently.
 - [ ] Root-cause isolation: a negative-control test (fails from a
       non-matching origin) and, if relevant, a filter-bypass isolation test
       (§5 Step 5).
